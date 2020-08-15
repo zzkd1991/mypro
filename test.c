@@ -10,6 +10,7 @@ int main()
     printf("kdzz1991");
     printf("eeeeeeeeee");
     return 667;
+    printf(fffffffff);
     return 67;
     return 667;
 }
