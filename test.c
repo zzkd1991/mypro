@@ -9,4 +9,5 @@ int main()
     printf("kdzz1991..");
     printf("kdzz1991");
     return 67;
+    return 667;
 }
