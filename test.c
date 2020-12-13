@@ -13,5 +13,4 @@ int main()
     printf(fffffffff);
     return 67;
     return 667;
-    add master
 }
