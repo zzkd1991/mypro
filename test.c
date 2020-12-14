@@ -18,7 +18,7 @@ int main()
     eeeeeee
     ggggggg
     ppppppp
-    xtttttt
+    xttteee
     ooooooo
     uuuuuuu
 }
