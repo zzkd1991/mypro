@@ -9,3 +9,5 @@
 8 跟踪分支。从远程分支checkout出来的本地分支，称为跟踪分支，跟踪分支是一种和某个远程分支有直接联系的本地分支，在跟踪分支里面输入git push，Git回自动推断应该向哪个服务器的哪个分支推送数据。同样在这些分支里
 运行git pull会获取所有远程索引，并把它们的数据都合并到本地分支中来。git checkout -b [分支名] [远程名]/[分支名]。要为本地分支设定不同于远程分支的名字，只需在第一个版本的命令里换个名字：
 git checkout -b sf origin/serverfix。现在你的本地分支sf会自动将推送和抓取数据的位置定位到origin/serverfix了。
+9 删除远程分支。git push [远程名]:[分支名]。如果想在服务器上删除serverfix分支，运行下面的命令:
+git push origin :serverfix
