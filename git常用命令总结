@@ -11,3 +11,4 @@
 git checkout -b sf origin/serverfix。现在你的本地分支sf会自动将推送和抓取数据的位置定位到origin/serverfix了。
 9 删除远程分支。git push [远程名]:[分支名]。如果想在服务器上删除serverfix分支，运行下面的命令:
 git push origin :serverfix
+10 查看配置信息git config --list
