@@ -12,3 +12,4 @@ git checkout -b sf origin/serverfix。现在你的本地分支sf会自动将推�
 9 删除远程分支。git push [远程名]:[分支名]。如果想在服务器上删除serverfix分支，运行下面的命令:
 git push origin :serverfix
 10 查看配置信息git config --list
+11 将本地分支同远程分支进行关联。远程已经创建了分支dev，而本地没有，在本地创建分支并与远程分支关联。step1:先将远程分支pull到本地 git pull origin dev。step2:再将本地创建分支并与之关联。git checkout -b dev origin/dev
