@@ -17,7 +17,4 @@ int main()
     hhhhhhhh
     eeeeeee
     fsdfsdfsdf
-	fdsfds
-	aaaaaaaa
-	bbbb
 }
