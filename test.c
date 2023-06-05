@@ -31,6 +31,7 @@ int main()
     nnnnn
 	ppppp
 	zzzzz
+	uuuuu
 	rrrrr
     sssss	
 }
