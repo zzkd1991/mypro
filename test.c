@@ -21,6 +21,6 @@ int main()
     bbbbb
     fdsfds
     aaaa
-	111
+    111
     cccc
 }
