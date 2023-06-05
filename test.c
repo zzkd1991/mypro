@@ -27,6 +27,6 @@ int main()
     3333
     dddddddd
     tttttt
-    ggggg
-    hhhhh
+    mmmmm
+    nnnnn
 }
