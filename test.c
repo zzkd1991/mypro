@@ -30,6 +30,6 @@ int main()
     mmmmm
     nnnnn
 	ppppp
-	qqqqq
+	uuuuu
 	rrrrr
 }
