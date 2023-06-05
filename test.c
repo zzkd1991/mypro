@@ -20,7 +20,7 @@ int main()
     aaaaa
     bbbbb
     fdsfds
-    aaaa
-    2222222
-    cccc
+    bbbbb
+    3333
+    dddddddd
 }
