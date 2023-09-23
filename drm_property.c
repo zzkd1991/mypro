@@ -432,8 +432,192 @@ int drm_mode_getblob_ioctl(struct drm_device *dev,
 						void *data, struct drm_file **file_priv)
 {
 	struct drm_mode_get_blob *out_resp = data;
+	struct drm_property_blob *blob;
+	int ret = 0;
+
+	if(!drm_core_check_feature(dev, DRIVER_MODESET))
+		return -EOPNOTSUPP;
+
+	blob = drm_property_lookup_blob(dev, out_resp->blob_id);
+	if(!blob)
+		return -ENOENT;
+
+
+	if(out_resp->length == blob->length)
+	{
+		if(copy_to_user(u64_to_user_ptr(out_resp->data), blob->data, blob->length))
+		{
+			ret = -EFAULT;
+			goto unref;
+		}
+	}
+	out_resp->length = blob->lenght;
+unref:
+	drm_property_blob_put(blob);
 	
-	
-	
-	
+	return ret;
 }
+
+int drm_mode_createblob_ioctl(struct drm_device *dev,
+						void *data, struct drm_file *file_priv)
+{
+	struct drm_mode_create_blob *out_resp = data;
+	struct drm_property_blob *blob;
+	int ret = 0;
+
+	if(!drm_core_check_feature(dev, DRIVER_MODESET))
+		return -EOPNOTSUPP;
+
+	blob = drm_property_create_blob(dev, out_resp->length, NULL);
+	if(IS_ERR(blob))
+		return PTR_ERR(blob);
+
+
+	if(copy_from_user(blob->data, u64_to_user_ptr(out_resp->data),
+						out_resp->length))
+	{
+		ret = -EFAULT;
+		goto out_blob;
+	}
+
+	mutex_lock(&dev->mode_config.blob_lock);
+	out_resp->blob_id = blob->base.id;
+	list_add_tail(&blob->head_file, &file_priv->blobs);
+	mutex_unlock(&dev->mode_config.blob_lock);
+
+	return 0;
+
+out_blob:
+	drm_property_blob_put(blob);
+	return ret;
+}
+
+int drm_mode_destroyblob_ioctl(struct drm_device *dev,
+					void *data, struct drm_file *file_priv)
+{
+	struct drm_mode_destroy_blob *out_resp = data;
+	struct drm_porperty_blob *blob = NULL, *bt;
+	bool found = false;
+	int ret = 0;
+
+	if(!drm_core_check_feature(dev, DRIVER_MODESET))
+		return -EOPNOTSUPP;
+
+	blob = drm_property_lookup_blob(dev, out_resp->blob_id);
+	if(!blob)
+		return -ENOENT;
+
+	mutex_lock(&dev->mode_config.blob_lock);
+	list_for_each_entry(bt, &file_priv->blobs, head_file)
+	{
+		if(bt == blob)
+		{
+			found = true;
+			break;
+		}
+	}
+	
+	if(!found)
+	{
+		ret = -EPERM;
+		goto err;
+	}
+
+	list_del_init(&blob->head_file);
+	mutex_unlock(&dev->mode_config.blob_lock);
+
+
+	drm_property_blob_put(blob);
+	drm_property_blob_put(blob);
+
+	return 0;
+
+err:
+	mutex_unlock(&dev->mode_confg.blob_lock);
+	drm_property_blob_put(blob);
+
+
+	return ret;
+}
+
+bool drm_property_change_valid_get(struct drm_property *property,
+				uint64_t value, struct drm_mode_object **ref)
+{
+	int i;
+
+	if(property->flags & DRM_MODE_PROP_IMMUTABLE)
+		return false;
+
+	*ref = NULL;
+
+	if(drm_property_type_is(property, DRM_MODE_PROP_RANGE))
+	{
+		if(value < property->value[0] || value > property->values[1])
+			return false;
+		return true;
+	}
+	else if(drm_property_type_is(property, DRM_MODE_PROP_SIGNED_RANGE))
+	{
+		int64_t svalue = U642I64(value);
+
+		if(svalue < U642I64(property->values[0]) ||
+				svalue > U642I64(property->value[1]))
+			return false;
+		return true;
+	}
+	else if(drm_property_type_is(property, DRM_MODE_PROP_BITMASK))
+	{
+		uint64_t valid_mask = 0;
+
+		for(i = 0; i < property->num_values; i++)
+			valid_mask |= (1ULL << property->values[i]);
+		return !(value & ~valid_mask);
+	}
+	else if(drm_property_type_is(property, DRM_MODE_PROP_BLOB))
+	{
+		struct drm_property_blob *blob;
+
+		if(value == 0)
+			return true;
+
+		blob = drm_property_lookup_blob(property->dev, value);
+		if(blob)
+		{
+			*ref = &blob->base;
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+	else if(drm_property_type_is(property, DRM_MODE_PROP_OBJECT))
+	{
+		if(value == 0)
+			return true;
+
+		*ref = __drm_mode_object_find(property->dev, NULL, value, property->values[0]);
+		return *ref != NULL;
+	}
+
+	for(i = 0; i < property->num_values; i++)
+		if(property->values[i] == value)
+			return true;
+	return false;
+}
+
+void drm_property_change_valid_put(struct drm_property *property,
+		struct drm_mode_object *ref)
+{
+	if(!ref)
+		return;
+
+	if(drm_property_type_is(property, DRM_MODE_PROP_OBJECT))
+	{
+		drm_mode_object_put(ref);
+	}
+	else if(drm_property_type_is(property, DRM_MODE_PROP_BLOB))
+		drm_property_blob_put(obj_to_blob(ref));
+}
+
+	
