@@ -581,3 +581,106 @@ static int vmap_pte_range(pmd_t *pmd, unsigned long addr,
 	
 	return 0;
 }
+
+static int vmap_pmd_range(pud_t *pud, unsigned long addr,
+				unsigned long end, pgprot_t prot, struct page **pages, int *nr)
+{
+	pmd_t *pmd;
+	unsigned long next;
+	
+	pmd = pmd_alloc(&init_mm, pud, addr);
+	if(!pmd)
+		return -ENOMEM;
+	do
+	{
+		next = pmd_addr_end(addr, end);
+		if(vmap_pte_range(pmd, addr, next, prot, pages, nr))
+			return -ENOMEM;
+	}while(pmd++, addr = next, addr != end);
+	
+	return 0;
+}
+
+static int vmap_pud_range(p4d_t *p4d, unsigned long addr,
+					unsigned long end, pgprot_t prot, struct page **pages, int *nr)
+{
+	pud_t *pud;
+	unsigned long next;
+	
+	pud = pud_alloc(&init_mm, p4d, addr);
+	if(!pud)
+		return -ENOMEM;
+	do
+	{
+		next = pud_addr_end(addr, end);
+		if(vmap_pmd_range(pud, addr, next, prot, pages, nr))
+	}while(pud++, addr = next, addr != end);
+	
+	return 0;
+}
+
+static int vmap_p4d_range(pgd_t *pgd, unsigned long addr,
+					unsigned long end, pgprot_t prot, struct page **pages, int *nr)
+{
+	p4d_t *p4d;
+	unsigned long next;
+	
+	p4d = p4d_alloc(&init_mm, pgd, addr);
+	if(!p4d)
+		return -ENOMEM;
+	
+	do
+	{
+		next = p4d_addr_end(addr, end);
+		if(vmap_pud_range(p4d, addr, next, prot, pages, nr))
+			return -ENOMEM;
+	}while(p4d++, addr = next, addr != end);
+	
+	return 0;
+}
+
+static int vmap_page_range_noflush(unsigned long start, unsigned long end,
+							pgprot_t prot, struct page **pages)
+{
+	pgd_t *pgd;
+	unsigned long next;
+	unsigned long addr = start;
+	int err = 0;
+	int nr = 0;
+	
+	BUG_ON(addr >= end);
+	pgd = pgd_offset_k(addr);
+	do
+	{
+		next = pgd_addr_end(addr, end);
+		err = vmap_p4d_range(pgd, addr, next, prot, pages, &nr);
+		if(err)
+			return err;
+	}while(pgd++, addr = next, addr != end);
+	
+	return nr;
+}
+
+static int vmap_page_range(unsigned long start, unsigned long end,
+				pgprot_t prot, struct page **pages)
+{
+	int ret;
+	
+	ret = vmap_page_range_noflush(start, end, prot, pages);
+	flush_cache_vmap(start, end);
+	return ret;
+}
+
+int is_vmalloc_or_module_addr(const void *x)
+{
+
+#if defined(CONFIG_MODULES) && defined(MODULES_VADDR)
+	unsigned long addr = (unsigned long)x;
+	if(addr >= MODULES_VADDR && addr < MODULES_END)
+		return 1;
+#endif
+
+	return is_vmalloc_addr(x);
+}
+
+/**
