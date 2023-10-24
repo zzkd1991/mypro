@@ -128,7 +128,7 @@ find_va_links(struct vmap_area *va,
 	return link;
 }
 
-static __always_inline void
+static void
 link_va(struct vmap_area *va, struct rb_root *root,
 			struct rb_node *parent, struct rb_node **link, struct list_head *head)
 {
