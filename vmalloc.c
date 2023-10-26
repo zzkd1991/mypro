@@ -156,7 +156,7 @@ link_va(struct vmap_area *va, struct rb_root *root,
 	list_add(&va->list, head);
 }
 
-static __always_inline void
+static void
 unlink_va(struct vmap_area *va, struct rb_root *root)
 {
 	if(WARN_ON(RB_EMPTY_NODE(&va->rb_node)))
@@ -681,6 +681,60 @@ int is_vmalloc_or_module_addr(const void *x)
 #endif
 
 	return is_vmalloc_addr(x);
+}
+
+static bool __purge_vmap_area_lazy(unsigned long start, unsigned long end)
+{
+	unsigned long resched_threshold;
+	struct llist_node *valist;
+	struct vmap_area *va;
+	struct vmap_area *n_va;
+	
+	lockdep_assert_held(&vmap_purge_lock);
+	
+	valist = llist_del_all(&vmap_purge_list);
+	if(unlikely(valist == NULL))
+		return false;
+	
+	
+	vmalloc_sync_all();
+	
+	llist_for_each_entry(va, valist, purge_list)
+	{
+		if(va->va_start < start)
+			start = va->va_start;
+		if(va->va_end > end)
+			end = va->va_end;
+	}
+	
+	flush_tlb_kernel_range(start, end);
+	resched_threshold = lazy_max_pages() << 1;
+	
+	spin_lock(&vmap_area_lock);
+	llist_for_each_entry_safe(va, n_va, valist, purge_list)
+	{
+			unsigned long nr = (va->va_end - va->va_start) >> PAGE_SIZE;
+			
+			merge_or_add_vmap_area(va, &free_vmap_area_root, &free_vmap_area_list);
+			
+			atomic_long_sub(nr, &vmap_lazy_nr);
+			
+			if(atomic_long_read(&vmap_lazy_nr) < resched_threshold)
+				cond_resched_lock(&vmap_area_lock);
+	}
+	
+	spin_unlock(&vmap_area_lock);
+	return true;
+}
+
+
+static void try_purge_vmap_area_lazy(void)
+{
+	if(mutex_trylock(&vmap_purge_lock))
+	{
+		__purge_vmap_area_lazy(ULONG_MAX, 0);
+		mutex_unlock(&vmap_purge_lock);
+	}
 }
 
 /**
