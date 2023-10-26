@@ -737,4 +737,727 @@ static void try_purge_vmap_area_lazy(void)
 	}
 }
 
+static void free_vmap_area_noflush(struct vmap_area *va)
+{
+	unsigned long nr_lazy;
+	
+	spin_lock(&vmap_area_lock);
+	unlink_va(va, &vmap_area_root);
+	spin_unlock(&vmap_area_lock);
+	
+	
+	nr_lazy = atomic_long_add_return((va->va_end - va->va_start) >> PAGE_SHIFT, &vmap_lazy_nr);
+	
+	llist_add(&va->purge_list, &vmap_purge_list);
+	
+	if(unlikely(nr_lazy > lazy_max_pages()))
+		try_purge_vmap_area_lazy();
+}
+
+static void free_unmap_vmap_area(struct vmap_area *va)
+{
+	flush_cache_vunmap(va->va_start, va->va_end);
+	unmap_vmap_area(va);
+	if(debug_pagealloc_enabled())
+		flush_tlb_kernel_range(va->va_start, va->va_end);
+	
+	free_vmap_area_noflush(va);
+}
+
+static struct vmap_area *find_vmap_area(unsigned long addr)
+{
+	struct vmap_area *va;
+	
+	spin_lock(&vmap_area_lock);
+	va = __find_vmap_area(addr);
+	spin_unlock(&vmap_area_lock);
+	
+	return va;
+}
+
+
+struct vmap_block_queue {
+	spinlock_t lock;
+	struct list_head free;
+};
+
+
+struct vmap_block {
+	spinlock_t lock;
+	struct vmap_area *va;
+	unsigned long free, dirty;
+	unsigned long dirty_min, dirty_max;
+	struct list_head free_list;
+	struct rcu_head rcu_head;
+	struct list_head purge;
+};
+
+
+static unsigned long addr_to_vb_idx(unsigned long addr)
+{
+	addr -= VMALLOC_START & ~(VMAP_BLOCK_SIZE-1);
+	addr /= VMAP_BLOCK_SIZE;
+	return addr;
+}
+
+static void *vmap_block_vaddr(unsigned long va_start, unsigned long pages_off)
+{
+	unsigned long addr;
+	
+	addr = va_start + (pages_off << PAGE_SHIFT);
+	BUG_ON(addr_to_vb_idx(addr) != addr_to_vb_idx(va_start));
+	return (void *)addr;
+}
+
+static void *new_vmap_block(unsigned int order, gfp_t gfp_mask)
+{
+	struct vmap_block_queue *vbq;
+	struct vmap_block *vb;
+	struct vmap_area *va;
+	unsigned long vb_idx;
+	int node, err;
+	void *vaddr;
+	
+	node = numa_node_id();
+	
+	
+	vb = kmalloc_node(sizeof(struct vmap_block), gfp_mask & GFP_RECLAIM_MASK, node);
+	if(unlikely(!vb))
+		return ERR_PTR(-ENOMEM);
+	
+	va = alloc_vmap_area(VMAP_BLOCK_SIZE, VMAP_BLOCK_SIZE, VMALLOC_START, VMALLOC_END, node, gfp_mask);
+	
+	if(IS_ERR(va))
+	{
+		kfree(vb);
+		return ERR_CAST(va);
+	}
+	
+	err = radix_tree_preload(gfp_mask);
+	if(unlikely(err))
+	{
+		kfree(vb);
+		free_vmap_area(va);
+		return ERR_PTR(err);
+	}
+	
+	
+	vaddr = vmap_block_vaddr(va->va_start, 0);
+	spin_lock_init(&vb->lock);
+	vb->va = va;
+	
+	BUG_ON(VMAP_BBMAP_BITS <= (1UL << order));
+	vb->free = VMAP_BBMAP_BITS - (1UL << order);
+	vb->dirty = 0;
+	vb->dirty_min = VMAP_BBMAP_BITS;
+	vb->dirty_max = 0;
+	INIT_LIST_HEAD(&vb->free_list);
+	
+	vb_idx = addr_to_vb_idx(va->va_start);
+	spin_lock(&vmap_block_tree_lock);
+	err = radix_tree_insert(&vmap_block_tree, vb_idx, vb);
+	spin_unlock(&vmap_block_tree_lock);
+	BUG_ON(err);
+	radix_tree_preload_end();
+	
+	vbq = &get_cpu_var(vmap_block_queue);
+	spin_lock(&vbq->lock);
+	list_add_tail_rcu(&vb->free_list, &vbq->free);
+	spin_unlock(&vbq->lock);
+	put_cpu_var(vmap_block_queue);
+	
+	return vaddr;
+}
+
+static void free_vmap_block(struct vmap_block *vb)
+{
+	struct vmap_block *tmp;
+	unsigned long vb_idx;
+	
+	vb_idx = addr_to_vb_idx(vb->va->va_start);
+	spin_lock(&vmap_block_tree_lock);
+	tmp = radix_tree_delete(&vmap_block_tree, vb_idx);
+	spin_unlock(&vmap_block_tree_lock);
+	BUG_ON(tmp != vb);
+
+	free_vmap_area_noflush(vb->va);
+	kfree_rcu(vb, rcu_head);
+}
+
+static void purge_fragmented_blocks(int cpu)
+{
+	LIST_HEAD(purge);
+	struct vmap_block *vb;
+	struct vmap_block *n_vb;
+	struct vmap_block_queue *vbq = &per_cpu(vmap_block_queue, cpu);
+	
+	
+	rcu_read_lock();
+	list_for_each_entry_rcu(vb, &vbq->free, free_list)
+	{
+		if(!(vb->free + vb->dirty == VMAP_BBMAP_BITS && vb->dirty != VMAP_BBMAP_BITS))
+			continue;
+		
+		spin_lock(&vb->lock);
+		if(vb->free + vb->dirty == VMAP_BBMAP_BITS && vb->dirty != VMAP_BBMAP_BITS)
+		{
+			vb->free = 0;
+			vb->dirty = VMAP_BBMAP_BITS;
+			vb->dirty_min = 0;
+			vb->dirty_max = VMAP_BBMAP_BITS;
+			spin_lock(&vbq->lock);
+			list_del_rcu(&vb->free_list);
+			spin_unlock(&vbq->lock);
+			spin_unlock(&vb->lock);
+			list_add_tail(&vb->purge, &purge);
+		}
+		else
+			spin_unlock(&vb->lock);
+	}
+	
+	rcu_read_unlock();
+	
+	list_for_each_entry_safe(vb, n_vb, &purge, purge)
+	{
+		list_del(&vb->purge);
+		free_vmap_block(vb);
+	}
+}
+
+static void purge_fragmented_blocks_allcpus(void)
+{
+	int cpu;
+	
+	for_each_possible_cpu(cpu)
+		purge_fragmented_blocks(cpu);
+}
+
+static void *vb_alloc(unsigned long size, gfp_t gfp_mask)
+{
+	struct vmap_block_queue *vbq;
+	struct vmap_block *vb;
+	void *vaddr = NULL;
+	unsigned int order;
+	
+	BUG_ON(offset_in_page(size));
+	BUG_ON(size > PAGE_SIZE * VMAP_MAX_ALLOC);
+	if(WARN_ON(size == 0))
+	{
+		return 0;
+	}
+	
+	order = get_order(size);
+	
+	rcu_read_lock();
+	vbq = &get_cpu_var(vmap_block_queue);
+	list_for_each_entry_rcu(vb, &vbq->free, free_list)
+	{
+		unsigned long pages_off;
+		
+		spin_lock(&vb->lock);
+		if(vb->free < (1UL << order))
+		{
+			spin_unlock(&vb->lock);
+			continue;
+		}
+		
+		pages_off = VMAP_BBMAP_BITS - vb->free;
+		vaddr = vmap_block_vaddr(vb->va->va_start, pages_off);
+		vb->free -= 1UL << order;
+		if(vb->free == 0)
+		{
+			spin_lock(&vbq->lock);
+			list_del_rcu(&vb->free_list);
+			spin_unlock(&vbq->lock);
+		}
+		
+		spin_unlock(&vb->lock);
+		break;
+	}
+	
+	put_cpu_var(vmap_block_queue);
+	rcu_read_unlock();
+	
+	/* Allocate new block if nothing was found */
+	if(!vaddr)
+		vaddr = new_vmap_block(order, gfp_mask);
+	
+	return vaddr;
+}
+
+static void vb_free(const void *addr, unsigned long size)
+{
+	unsigned long offset;
+	unsigned long vb_idx;
+	unsigned int order;
+	struct vmap_block *vb;
+	
+	
+	BUG_ON(offset_in_page(size));
+	BUG_ON(size > PAGE_SIZE * VMAP_MAX_ALLOC);
+	
+	flush_cache_vunmap((unsigned long)addr, (unsigned long)addr + size);
+	
+	order = get_order(size);
+	
+	offset = (unsigned long)addr & (VMAP_BLOCK_SIZE - 1);
+	offset >>= PAGE_SHIFT;
+	
+	vb_idx = addr_to_vb_idx((unsigned long)addr);
+	rcu_read_lock();
+	vb = radix_tree_lookup(&vmap_block_tree, vb_idx);
+	rcu_read_unlock();
+	BUG_ON(!vb);
+	
+	
+	vunmap_page_range((unsigned long)addr, (unsigned long)addr + size);
+	
+	if(debug_pagealloc_enabled())
+		flush_tlb_kernel_range((unsigned long)addr,
+						(unsigned long)addr + size);
+						
+	spin_lock(&vb->lock);
+	
+	/*Expand dirty range */
+	vb->dirty_min = min(vb->dirty_min, offset);
+	vb->dirty_max = max(vb->dirty_max, offset + (1UL << order));
+	
+	vb->dirty += 1UL << order;
+	if(vb->dirty == VMAP_BBMAP_BITS)
+	{
+		BUG_ON(vb->free);
+		spin_unlock(&vb->lock);
+		free_vmap_block(vb);
+	}
+	else
+		spin_unlock(&vb->lock);
+}
+
+static void _vm_unmap_aliases(unsigned long start, unsigned long end, int flush)
+{
+	int cpu;
+	
+	if(unlikely(!vmap_initialized))
+		return;
+	
+	might_sleep();
+	
+	for_each_possible_cpu(cpu)
+	{
+		struct vmap_block_queue *vbq = &per_cpu(vmap_block_queue, cpu);
+		struct vmap_block *vb;
+		
+		rcu_read_lock();
+		list_for_each_entry_rcu(vb, &vbq->free, free_list)
+		{
+			spin_lock(&vb->lock);
+			if(vb->dirty)
+			{
+				unsigned long va_start = vb->va->va_start;
+				unsigned long s, e;
+				
+				s = va_start + (vb->dirty_min << PAGE_SHIFT);
+				e = va_start + (vb->dirty_max << PAGE_SHIFT);
+				
+				start = min(s, start);
+				end = max(e, end);
+				
+				flush = 1;
+			}
+			
+			spin_unlock(&vb->lock);
+		}
+		rcu_read_unlock();
+	}
+	
+	mutex_lock(&vmap_purge_lock);
+	purge_fragmented_blocks_allcpus();
+	if(!__purge_vmap_area_lazy(start, end) && flush)
+		flush_tlb_kernel_range(start, end);
+	mutex_unlock(&vmap_purge_lock);
+}
+
+void vm_unmap_aliases(void)
+{
+	unsigned long start = ULONG_MAX, end = 0;
+	int flush = 0;
+	
+	_vm_unmap_aliases(start, end, flush);
+}
+
+void vm_unmap_ram(const void *mem, unsigned int count)
+{
+	unsigned long size = (unsigned long)count << PAGE_SHIFT;
+	unsigned long addr = (unsigned long)mem;
+	struct vmap_area *va;
+	
+	might_sleep();
+	BUG_ON(!addr);
+	BUG_ON(addr < VMALLOC_START);
+	BUG_ON(addr > VMALLOC_END);
+	BUG_ON(!PAGE_ALIGNED(addr));
+	
+	if(likely(count <= VMAP_MAX_ALLOC))
+	{
+		debug_check_no_locks_freed(mem, size);
+		vb_free(mem, size);
+		return;
+	}
+	
+	va = find_vmap_area(addr);
+	BUG_ON(!va);
+	debug_check_no_locks_freed((void *)va->va_start,
+						(va->va_end - va->va_start));
+
+	free_unmap_vmap_area(va);
+}
+
+void *vm_map_ram(struct page **pages, unsigned int count, int node, pgprot_t prot)
+{
+	unsigned long size = (unsigned long)count << PAGE_SHIFT;
+	unsigned long addr;
+	void *mem;
+	
+	if(likely(count <= VMAP_MAX_ALLOC))
+	{
+		mem = vb_alloc(size, GFP_KERNEL);
+		if(IS_ERR(mem))
+			return NULL;
+		addr = (unsigned long)mem;
+	}
+	else
+	{
+		struct vmap_area *va;
+		va = alloc_vmap_area(size, PAGE_SIZE,
+				VMALLOC_START, VMALLOC_END, node, GFP_KERNEL);
+		if(IS_ERR(va))
+			return NULL;
+		
+		addr = va->va_start;
+		mem = (void *)addr;
+	}
+	
+	if(vmap_page_range(addr, addr + size, prot, pages) < 0)
+	{
+		vm_unmap_ram(mem, count);
+		return;
+	}
+	
+	return mem;
+}
+
+void __init vm_area_add_early(struct vm_struct *vm)
+{
+	struct vm_struct *tmp, **p;
+	
+	BUG_ON(vmap_initialized);
+	for(p = *vmlist; (tmp = *p) != NULL; p = &tmp->next)
+	{
+		if(tmp->addr >= vm->addr)
+		{
+			BUG_ON(tmp->addr < vm->addr + vm->size);
+			break;
+		}
+		else
+			BUG_ON(tmp->addr + tmp->size > vm->addr);
+	}
+	
+	vm->next = *p;
+	*p =vm;
+}
+
+
+void __init vm_area_register_early(struct vm_struct *vm, size_t align)
+{
+	static size_t vm_init_off __initdata;
+	unsigned long addr;
+	
+	addr = ALIGN(VMALLOC_START + vm_init_off, align);
+	vm_init_off = PFN_ALIGN(addr + vm->size) - VMALLOC_START;
+	
+	vm->addr = (void *)addr;
+	
+	vm_area_add_early(vm);
+}
+
+static void vmap_init_free_space(void)
+{
+	unsigned long vmap_start = 1;
+	const unsigned long vmap_end = ULONG_MAX;
+	struct vmap_area *busy, *free;
+	
+	list_for_each_entry(busy, &vmap_area_list, list)
+	{
+		if(busy->va_start - vmap_start > 0)
+		{
+			free = kmem_cache_zalloc(vmap_area_cachep, GFP_NOWAIT);
+			if(!WARN_ON_ONCE(!free))
+			{
+				free->va_start = vmap_start;
+				free->va_end = busy->va_start;
+				
+				insert_vmap_area_augment(free, NULL,
+						&free_vmap_area_root,
+								&free_vmap_area_list);
+			}
+		}
+		
+		vmap_start = busy->va_end;
+		
+	}
+	
+	if(vmap_end - vmap_start > 0)
+	{
+		free = kmem_cache_zalloc(vmap_area_cachep, GFP_NOWAIT);
+		if(!WARN_ON_ONCE(!free))
+		{
+			free->va_start = vmap_start;
+			free->va_end = vmap_end;
+			
+			insert_vmap_area_augment(free, NULL,
+				&free_vmap_area_root,
+				&free_vmap_area_list);
+		}
+	}
+}
+
+void __init vmalloc_init(void)
+{
+	struct vmap_area *va;
+	struct vm_struct *tmp;
+	int i;
+	
+	vmap_area_cachep = KMEM_CACHE(vmap_area, SLAB_PANIC);
+	
+	for_each_possible_cpu(i)
+	{
+		struct vmap_block_queue *vbq;
+		struct vfree_deferred *p;
+		
+		vbq = &per_cpu(vmap_block_queue, i);
+		spin_lock_init(&vbq->lock);
+		INIT_LIST_HEAD(&vbp->free);
+		p = &per_cpu(vfree_deferred, i);
+		init_llist_head(&p->list);
+		INIT_WORK(&p->wq, free_work);
+	}
+	
+	/* Import existing vmlist entries */
+	for(tmp = vmlist; tmp; tmp = tmp->next)
+	{
+		va = kmem_cache_zalloc(vmap_area_cachep, GFP_NOWAIT);
+		if(WARN_ON_ONCE(!va))
+			continue;
+		
+		va->va_start = (unsigned long)tmp->addr;
+		va->va_end = va->va_start + tmp->size;
+		va->vm = tmp;
+		insert_vmap_area(va, &vmap_area_root, &vmap_area_list);
+	}
+	
+	vmap_init_free_space()
+	vmap_initialized = true;
+}
+
+int map_kernel_range_noflush(unsigned long addr, unsigned long size,
+					pgprot_t prot, struct page **pages)
+{
+	return vmap_page_range_noflush(addr, addr + size, prot, pages);
+}
+
+void unmap_kernel_range_noflush(unsigned long addr, unsigned long size)
+{
+	vunmap_page_range(addr, addr + size);
+}
+
+void unmap_kernel_range(unsigned long addr, unsigned long size)
+{
+	unsigned long end = addr + size;
+	
+	flush_cache_vunmap(addr, end);
+	vunmap_page_range(addr, end);
+	flush_tlb_kernel_range(addr, end);
+}
+
+int map_vm_area(struct vm_struct *area, pgprot_t prot, struct page **pages)
+{
+	unsigned long addr = (unsigned long)area->addr;
+	unsigned long end = addr + get_vm_area_size(area);
+	int err;
+	
+	err = vmap_page_range(addr, end, prot, pages);
+	
+	return err > 0 ? 0 : err;
+}
+
+static void setup_vmalloc_vm(struct vm_struct *vm, struct vmap_area *va,
+					unsigned long flags, const void *caller)
+{
+	spin_lock(&vmap_area_lock);
+	vm->flags = flags;
+	vm->addr = (void *)va->va_start;
+	vm->size = va->va_end - va->va_start;
+	vm->caller = caller;
+	va->vm = v;
+	spin_unlock(&vmap_area_lock);
+}
+
+static struct vm_struct *__get_vm_area_node(unsigned long size,
+		unsigned long align, unsigned long flags, unsigned long start,
+		unsigned long end, int node, gfp_t gfp_mask, const void *caller)
+{
+	struct vmap_area *va;
+	struct vm_struct *area;
+	
+	BUG_ON(in_interrupt());
+	size = PAGE_ALIGN(size);
+	if(unlikely(!size))
+		return NULL;
+	
+	if(flags & VM_IOREMAP)
+		align = 1ul << clamp_t(int, get_count_order_long(size),
+								PAGE_SHIFT, IOREMAP_MAX_ORDER);
+								
+	area = kzalloc_node(sizeof(*area), gfp_mask & GFP_RECLAIM_MASK, node);
+	if(unlikely(!area))
+		return NULL;
+	
+	if(!(flag & VM_NO_GUARD))
+		size += PAGE_SIZE;
+	
+	va = alloc_vmap_area(size, align, start, end, node, gfp_mask);
+	if(IS_ERR(va))
+	{
+		kfree(area);
+		return NULL;
+	}
+	
+	setup_vmalloc_vm(area, va, flags, caller);
+	
+	return area;
+}
+
+struct vm_struct *__get_vm_area(unsigned long size, unsigned long flags,
+					unsigned long start, unsigned long end)
+{
+	return __get_vm_area_node(size, 1, flags, start, end, NUMA_NO_NODE,
+					GFP_KERNEL, __buildtin_return_address(0));
+}
+
+struct vm_struct *__get_vm_area_caller(unsigned long size, unsigned long flags,
+						unsigned long start, unsigned long end,
+						const void *caller)
+{
+	return __get_vm_area_node(size, 1, flags, start, end, NUMA_NO_NODE,
+						GFP_KERNEL, caller);
+}
+
+struct vm_struct *get_vm_area(unsigned long size, unsigned long flags)
+{
+	return __get_vm_area_node(size, 1, flags, VMALLOC_START, VMALLOC_END,
+					NUMA_NO_NODE, GFP_KERNEL,
+					__builtin_return_address(0));
+}
+
+struct vm_struct *get_vm_area_caller(unsigned long size, unsigned long flags,
+							const void *caller)
+{
+	return __get_vm_area_node(size, 1, flags, VMALLOC_START, VMALLOC_END,
+					NUMA_NO_NODE, GFP_KERNEL, caller);
+}
+
+struct vm_struct *find_vm_area(const void *addr)
+{
+	struct vmap_area *va;
+	
+	va = find_vmap_area((unsigned long)addr);
+	if(!va)
+		return NULL;
+	
+	return va->vm;
+}
+
+struct vm_struct *remove_vm_area(const void *addr)
+{
+	struct vmap_area *va;
+	
+	might_sleep();
+	
+	spin_lock(&vmap_area_lock);
+	va = __find_vmap_area((unsigned long)addr);
+	if(va && va->vm)
+	{
+		struct vm_struct *vm = va->vm;
+		
+		va->vm = NULL;
+		spin_unlock(&vmap_area_lock);
+		
+		kasan_free_shadow(vm);
+		free_unmap_vmap_area(va);
+		
+		return vm;
+	}
+	
+	spin_unlock(&vmap_area_lock);
+	return NULL;
+}
+
+static inline void set_area_direct_map(const struct vm_struct *area,
+								int (*set_direct_map)(struct page *page))
+{
+	int i;
+	
+	for(i = 0; i < area->nr_pages; i++)
+		if(page_address(area->pages[i]))
+			set_direct_map(area->pages[i]);
+}
+
+static void vm_remove_mappings(struct vm_struct *area, int deallocate_pages)
+{
+	unsigned long start = ULONG_MAX, end = 0;
+	int flush_reset = area->flags & VM_FLUSH_RESET_PERMS;
+	int flush_dmap = 0;
+	int i;
+	
+	remove_vm_area(area->addr);
+	
+	
+	if(!flush_reset)
+		return;
+	
+	if(!deallocate_pages)
+	{
+		vm_unmap_aliases();
+		return;
+	}
+	
+	for(i = 0; i < area->nr_pages; i++)
+	{
+		unsigned long addr = (unsigned long)page_address(area->pages[i]);
+		if(addr)
+		{
+			start = min(addr, start);
+			end = max(addr + PAGE_SIZE, end);
+			flush_dmap = 1;
+		}
+	}
+	
+	set_area_direct_map(area, set_direct_map_invalid_noflush);
+	_vm_unmap_aliases(start, end, flush_dmap);
+	set_area_direct_map(area, set_direct_map_default_noflush);
+}
+
+static void __vunmap(const void *addr, int deallocate_pages)
+{
+	struct vm_struct *area;
+	
+	if(!addr)
+		return;
+	
+	if(WARN(!PAGE_ALIGNED))
+	
+	
+}
+
+
 /**
