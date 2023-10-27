@@ -95,3 +95,37 @@ void __mmu_notifier_change_pte(struct mm_struct *mm, unsigned long address, pte_
 	
 	srcu_read_unlock(&srcu, id);
 }
+
+int __mmu_notifier_invalidate_range_start(struct mmu_notifier_range *range)
+{
+	struct mmu_notifier *mn;
+	int ret = 0;
+	int id;
+	
+	id = srcu_read_lock(&srcu);
+	hlist_for_each_entry_rcu(mn, &range->mm->mmu_notifier_mm->list, hlist)
+	{
+		if(mn->ops->invalidate_range_start)
+		{
+			int _ret;
+			
+			if(!mmu_notifier_range_blockable(range))
+				non_block_start();
+			_ret = mn->ops->invalidate_range_start(mn, range);
+			if(!mmu_notifier_range_blockable(range))
+				non_block_end();
+			if(_ret)
+			{
+				pr_info("%pS callback failed with %d in %sblockable context.\n",
+					mn->ops->invalidate_range_start, _ret,
+					!mmu_notifier_range_blockable(range) ? "non-" : "");
+				WARN_ON(mmu_notifier_range_blockable(range) ||
+					_ret != -EAGAIN);
+				ret = _ret;
+			}
+		}
+	}
+	srcu_read_unlock(&srcu, id);
+	
+	return ret;
+}
