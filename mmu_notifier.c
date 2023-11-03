@@ -292,6 +292,66 @@ void __mmu_notifier_mm_destroy(struct mm_struct *mm)
 
 void mmu_notifier_unregister(struct mmu_notifier *mn, struct mm_struct *mm)
 {
+	BUG_ON(atomic_read(&mm->mm_count) <= 0);
 	
+	if(!hlist_unhashed(&mn->hlist))
+	{
+		int id;
+		
+		id = srcu_read_lock(&srcu);
+		
+		if(mn->ops->release)
+			mn->ops->release(&srcu, id);
+		srcu_read_unlock(&srcu, id);
+		
+		spin_lock(&mm->mmu_notifier_mm->lock);
+		
+		hlist_del_init_rcu(&mn->hlist);
+		spin_unlock(&mm->mmu_notifier_mm->lock);
+	}
 	
+	synchronize_srcu(&srcu);
+	
+	BUG_ON(atomic_read(&mm->mm_count <= 0));
+	
+	mmdrop(mm);
+}
+
+static void mmu_notifier_free_rcu(struct rcu_head *rcu)
+{
+	struct mmu_notifier *mn = container_of(rcu, struct mmu_notifier, rcu);
+	struct mm_struct *mm = mn->mm;
+	
+	mn->ops->free_notifier(mn);
+	mmdrop(mm);
+}
+
+void mmu_notifier_put(struct mmu_notifier *mn)
+{
+	struct mm_struct *mm = mn->mm;
+	
+	spin_lock(&mm->mmu_notifier_mm->lock);
+	if(WARN_ON(!mn->users) || --mn->users)
+		goto out_unlock;
+	hlist_del_init_rcu(&mn->hlist);
+	spin_unlock(&mm->mmu_notifier_mm->lock);
+	
+	call_srcu(&srcu, &mn->rcu, mmu_notifier_free_rcu);
+	return;
+	
+out_unlock:
+	spin_unlock(&mm->mmu_notifier_mm->lock);
+}
+
+void mmu_notifier_synchronize(void)
+{
+	synchronize_srcu(&srcu);
+}
+
+bool mmu_notifier_range_update_to_read_only(const struct mmu_notifier_range *range)
+{
+	if(!range->vma || range->event != MMU_NOTIFY_PROTECTION_VMA)
+		return false;
+	
+	return range->vma->vm_flags & VM_READ;
 }
